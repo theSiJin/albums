@@ -1,0 +1,81 @@
+name: Import albums to D1
+
+on:
+  workflow_dispatch:
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Generate SQL
+        run: |
+          python3 <<'PY'
+          import csv
+
+          def sql_string(value):
+              if value is None or value == "":
+                  return "NULL"
+              value = str(value).replace("'", "''")
+              return "'" + value + "'"
+
+          with open("spreadsheet.csv", newline="", encoding="utf-8") as f:
+              rows = csv.reader(f)
+
+              with open("/tmp/import.sql", "w", encoding="utf-8") as out:
+                  for row in rows:
+                      if len(row) < 11:
+                          continue
+
+                      (
+                          _,
+                          album,
+                          artist,
+                          year,
+                          listened_on,
+                          reasons,
+                          artwork,
+                          discogs,
+                          main_artists,
+                          genres,
+                          styles,
+                      ) = row[:11]
+
+                      # Remove the Google Sheets IMAGE() wrapper.
+                      if artwork.startswith('=IMAGE("') and artwork.endswith('")'):
+                          artwork = artwork[8:-2]
+
+                      year_value = year if year.isdigit() else "NULL"
+
+                      out.write(
+                          "INSERT INTO albums "
+                          "(album, artist, year, listened_on, reasons, "
+                          "artwork_url, discogs_url, main_artists, genres, styles) "
+                          "VALUES ("
+                          f"{sql_string(album)}, "
+                          f"{sql_string(artist)}, "
+                          f"{year_value}, "
+                          f"{sql_string(listened_on)}, "
+                          f"{sql_string(reasons)}, "
+                          f"{sql_string(artwork)}, "
+                          f"{sql_string(discogs)}, "
+                          f"{sql_string(main_artists)}, "
+                          f"{sql_string(genres)}, "
+                          f"{sql_string(styles)}"
+                          ");\n"
+                      )
+
+          print("Generated SQL import file")
+          PY
+
+          wc -l /tmp/import.sql
+
+      - name: Import into D1
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute albums-db --remote --file=/tmp/import.sql --yes
