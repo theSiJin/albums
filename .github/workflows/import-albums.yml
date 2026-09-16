@@ -8,32 +8,41 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Generate SQL
+        shell: python
         run: |
-          python3 <<'PY'
           import csv
 
-          def sql_string(value):
-              if value is None or value == "":
-                  return "NULL"
-              value = str(value).replace("'", "''")
-              return "'" + value + "'"
+          INPUT = "spreadsheet.csv"
+          OUTPUT = "/tmp/import.sql"
 
-          with open("spreadsheet.csv", newline="", encoding="utf-8") as f:
-              rows = csv.reader(f)
+          def sql_escape(value):
+              if value is None:
+                  return ""
+              return value.replace("'", "''")
 
-              with open("/tmp/import.sql", "w", encoding="utf-8") as out:
-                  imported = 0
-                  skipped = 0
-                  
-                  for row in rows:
-                      if len(row) < 11:
+          imported = 0
+          skipped = 0
+          skipped_rows = []
+
+          with open(INPUT, "r", encoding="utf-8-sig", newline="") as f:
+              reader = csv.reader(f)
+              rows = list(reader)
+
+          with open(OUTPUT, "w", encoding="utf-8") as out:
+              for row_number, row in enumerate(rows, start=1):
+
+                  # We expect at least 11 columns.
+                  if len(row) < 11:
                       skipped += 1
+                      skipped_rows.append(
+                          f"Row {row_number}: only {len(row)} columns"
+                      )
                       continue
-                  
+
                   (
                       _,
                       album,
@@ -47,46 +56,77 @@ jobs:
                       genres,
                       styles,
                   ) = row[:11]
-                  
-                  # Skip rows without the required album/artist fields.
+
                   album = album.strip()
                   artist = artist.strip()
-                  
+                  year = year.strip()
+                  listened_on = listened_on.strip()
+                  reasons = reasons.strip()
+                  artwork = artwork.strip()
+                  discogs = discogs.strip()
+                  main_artists = main_artists.strip()
+                  genres = genres.strip()
+                  styles = styles.strip()
+
+                  # album and artist are required by the D1 schema.
                   if not album or not artist:
                       skipped += 1
+                      skipped_rows.append(
+                          f"Row {row_number}: album={album!r}, artist={artist!r}"
+                      )
                       continue
 
-                      # Remove the Google Sheets IMAGE() wrapper.
-                      if artwork.startswith('=IMAGE("') and artwork.endswith('")'):
-                          artwork = artwork[8:-2]
+                  # Convert year to SQL NULL when empty/non-numeric.
+                  if year.isdigit():
+                      year_sql = year
+                  else:
+                      year_sql = "NULL"
 
-                      year_value = year if year.isdigit() else "NULL"
+                  sql = f"""
+          INSERT INTO albums (
+              album,
+              artist,
+              year,
+              listened_on,
+              reasons,
+              artwork_url,
+              discogs_url,
+              main_artists,
+              genres,
+              styles
+          ) VALUES (
+              '{sql_escape(album)}',
+              '{sql_escape(artist)}',
+              {year_sql},
+              '{sql_escape(listened_on)}',
+              '{sql_escape(reasons)}',
+              '{sql_escape(artwork)}',
+              '{sql_escape(discogs)}',
+              '{sql_escape(main_artists)}',
+              '{sql_escape(genres)}',
+              '{sql_escape(styles)}'
+          );
+          """
 
-                      out.write(
-                          "INSERT INTO albums "
-                          "(album, artist, year, listened_on, reasons, "
-                          "artwork_url, discogs_url, main_artists, genres, styles) "
-                          "VALUES ("
-                          f"{sql_string(album)}, "
-                          f"{sql_string(artist)}, "
-                          f"{year_value}, "
-                          f"{sql_string(listened_on)}, "
-                          f"{sql_string(reasons)}, "
-                          f"{sql_string(artwork)}, "
-                          f"{sql_string(discogs)}, "
-                          f"{sql_string(main_artists)}, "
-                          f"{sql_string(genres)}, "
-                          f"{sql_string(styles)}"
-                          ");\n"
-                      )
-                      imported += 1
+                  out.write(sql)
+                  imported += 1
 
-          print("Generated SQL import file")
+          print(f"Total CSV rows: {len(rows)}")
           print(f"Imported rows: {imported}")
           print(f"Skipped rows: {skipped}")
-          PY
 
+          if skipped_rows:
+              print("")
+              print("Skipped rows:")
+              for item in skipped_rows:
+                  print(item)
+
+      - name: Show generated SQL statistics
+        run: |
+          echo "SQL file:"
           wc -l /tmp/import.sql
+          echo "SQL size:"
+          du -h /tmp/import.sql
 
       - name: Import into D1
         uses: cloudflare/wrangler-action@v3
@@ -94,3 +134,10 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: d1 execute albums-db --remote --file=/tmp/import.sql --yes
+
+      - name: Verify import
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 execute albums-db --remote --command="SELECT COUNT(*) AS total FROM albums; SELECT COUNT(*) AS missing_artist FROM albums WHERE artist IS NULL OR artist = ''; SELECT id, album, artist, year FROM albums ORDER BY id LIMIT 10;"
