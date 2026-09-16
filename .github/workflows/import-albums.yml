@@ -1,143 +1,160 @@
-name: Import albums to D1
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
 
-on:
-  workflow_dispatch:
+    // --------------------------------------------------
+    // GET /
+    // --------------------------------------------------
+    if (url.pathname === "/") {
+      return new Response("Albums API is running\n", {
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+        },
+      });
+    }
 
-jobs:
-  import:
-    runs-on: ubuntu-latest
+    // --------------------------------------------------
+    // GET /db-test
+    // --------------------------------------------------
+    if (url.pathname === "/db-test") {
+      const result = await env.DB
+        .prepare("SELECT 1 AS ok")
+        .first();
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      return Response.json(result);
+    }
 
-      - name: Generate SQL
-        shell: python
-        run: |
-          import csv
+    // --------------------------------------------------
+    // GET /next
+    //
+    // Return one album that has not been listened to
+    // or skipped yet.
+    // --------------------------------------------------
+    if (url.pathname === "/next" && request.method === "GET") {
+      const album = await env.DB
+        .prepare(`
+          SELECT
+            a.id,
+            a.album,
+            a.artist,
+            a.year,
+            a.listened_on,
+            a.reasons,
+            a.artwork_url,
+            a.discogs_url,
+            a.main_artists,
+            a.genres,
+            a.styles,
+            COALESCE(l.status, 'unheard') AS status
+          FROM albums a
+          LEFT JOIN listening l
+            ON a.id = l.album_id
+          WHERE COALESCE(l.status, 'unheard') = 'unheard'
+          ORDER BY RANDOM()
+          LIMIT 1
+        `)
+        .first();
 
-          INPUT = "spreadsheet.csv"
-          OUTPUT = "/tmp/import.sql"
+      if (!album) {
+        return Response.json(
+          {
+            error: "No unheard albums remaining",
+          },
+          { status: 404 }
+        );
+      }
 
-          def sql_escape(value):
-              if value is None:
-                  return ""
-              return value.replace("'", "''")
+      return Response.json(album);
+    }
 
-          imported = 0
-          skipped = 0
-          skipped_rows = []
+    // --------------------------------------------------
+    // POST /done
+    //
+    // Mark an album as listened.
+    //
+    // Body:
+    // {
+    //   "album_id": 123
+    // }
+    // --------------------------------------------------
+    if (url.pathname === "/done" && request.method === "POST") {
+      let body;
 
-          with open(INPUT, "r", encoding="utf-8-sig", newline="") as f:
-              reader = csv.reader(f)
-              rows = list(reader)
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json(
+          {
+            error: "Invalid JSON body",
+          },
+          { status: 400 }
+        );
+      }
 
-          with open(OUTPUT, "w", encoding="utf-8") as out:
-              for row_number, row in enumerate(rows, start=1):
+      const albumId = Number(body.album_id);
 
-                  # We expect at least 11 columns.
-                  if len(row) < 11:
-                      skipped += 1
-                      skipped_rows.append(
-                          f"Row {row_number}: only {len(row)} columns"
-                      )
-                      continue
+      if (!Number.isInteger(albumId) || albumId <= 0) {
+        return Response.json(
+          {
+            error: "album_id must be a positive integer",
+          },
+          { status: 400 }
+        );
+      }
 
-                  (
-                      _,
-                      album,
-                      artist,
-                      year,
-                      listened_on,
-                      reasons,
-                      artwork,
-                      discogs,
-                      main_artists,
-                      genres,
-                      styles,
-                  ) = row[:11]
+      // Make sure the album exists.
+      const album = await env.DB
+        .prepare(`
+          SELECT id, album, artist
+          FROM albums
+          WHERE id = ?
+        `)
+        .bind(albumId)
+        .first();
 
-                  album = album.strip()
-                  artist = artist.strip()
-                  year = year.strip()
-                  listened_on = listened_on.strip()
-                  reasons = reasons.strip()
-                  artwork = artwork.strip()
-                  discogs = discogs.strip()
-                  main_artists = main_artists.strip()
-                  genres = genres.strip()
-                  styles = styles.strip()
+      if (!album) {
+        return Response.json(
+          {
+            error: "Album not found",
+          },
+          { status: 404 }
+        );
+      }
 
-                  # album and artist are required by the D1 schema.
-                  if not album or not artist:
-                      skipped += 1
-                      skipped_rows.append(
-                          f"Row {row_number}: album={album!r}, artist={artist!r}"
-                      )
-                      continue
+      const now = new Date().toISOString();
 
-                  # Convert year to SQL NULL when empty/non-numeric.
-                  if year.isdigit():
-                      year_sql = year
-                  else:
-                      year_sql = "NULL"
+      await env.DB
+        .prepare(`
+          INSERT INTO listening (
+            album_id,
+            status,
+            listened_on,
+            updated_at
+          )
+          VALUES (?, 'listened', ?, ?)
+          ON CONFLICT(album_id) DO UPDATE SET
+            status = 'listened',
+            listened_on = excluded.listened_on,
+            updated_at = excluded.updated_at
+        `)
+        .bind(albumId, now, now)
+        .run();
 
-                  sql = f"""
-          INSERT INTO albums (
-              album,
-              artist,
-              year,
-              listened_on,
-              reasons,
-              artwork_url,
-              discogs_url,
-              main_artists,
-              genres,
-              styles
-          ) VALUES (
-              '{sql_escape(album)}',
-              '{sql_escape(artist)}',
-              {year_sql},
-              '{sql_escape(listened_on)}',
-              '{sql_escape(reasons)}',
-              '{sql_escape(artwork)}',
-              '{sql_escape(discogs)}',
-              '{sql_escape(main_artists)}',
-              '{sql_escape(genres)}',
-              '{sql_escape(styles)}'
-          );
-          """
+      return Response.json({
+        ok: true,
+        album_id: albumId,
+        status: "listened",
+        listened_on: now,
+        album: album.album,
+        artist: album.artist,
+      });
+    }
 
-                  out.write(sql)
-                  imported += 1
-
-          print(f"Total CSV rows: {len(rows)}")
-          print(f"Imported rows: {imported}")
-          print(f"Skipped rows: {skipped}")
-
-          if skipped_rows:
-              print("")
-              print("Skipped rows:")
-              for item in skipped_rows:
-                  print(item)
-
-      - name: Show generated SQL statistics
-        run: |
-          echo "SQL file:"
-          wc -l /tmp/import.sql
-          echo "SQL size:"
-          du -h /tmp/import.sql
-
-      - name: Import into D1
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: d1 execute albums-db --remote --file=/tmp/import.sql --yes
-
-      - name: Verify import
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: d1 execute albums-db --remote --command="SELECT COUNT(*) AS total FROM albums; SELECT COUNT(*) AS missing_artist FROM albums WHERE artist IS NULL OR artist = ''; SELECT id, album, artist, year FROM albums ORDER BY id LIMIT 10;"
+    // --------------------------------------------------
+    // 404
+    // --------------------------------------------------
+    return new Response("Not found\n", {
+      status: 404,
+    });
+  },
+};
