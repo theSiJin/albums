@@ -26,23 +26,35 @@ jobs:
               rows = csv.reader(f)
 
               with open("/tmp/import.sql", "w", encoding="utf-8") as out:
+                  imported = 0
+                  skipped = 0
+                  
                   for row in rows:
                       if len(row) < 11:
-                          continue
-
-                      (
-                          _,
-                          album,
-                          artist,
-                          year,
-                          listened_on,
-                          reasons,
-                          artwork,
-                          discogs,
-                          main_artists,
-                          genres,
-                          styles,
-                      ) = row[:11]
+                      skipped += 1
+                      continue
+                  
+                  (
+                      _,
+                      album,
+                      artist,
+                      year,
+                      listened_on,
+                      reasons,
+                      artwork,
+                      discogs,
+                      main_artists,
+                      genres,
+                      styles,
+                  ) = row[:11]
+                  
+                  # Skip rows without the required album/artist fields.
+                  album = album.strip()
+                  artist = artist.strip()
+                  
+                  if not album or not artist:
+                      skipped += 1
+                      continue
 
                       # Remove the Google Sheets IMAGE() wrapper.
                       if artwork.startswith('=IMAGE("') and artwork.endswith('")'):
@@ -67,8 +79,11 @@ jobs:
                           f"{sql_string(styles)}"
                           ");\n"
                       )
+                      imported += 1
 
           print("Generated SQL import file")
+          print(f"Imported rows: {imported}")
+          print(f"Skipped rows: {skipped}")
           PY
 
           wc -l /tmp/import.sql
